@@ -3,12 +3,12 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-
 from sklearn.linear_model import LinearRegression 
 from sklearn.metrics import classification_report  
 from sklearn.linear_model import LogisticRegression
 from scipy.signal import butter, filtfilt
 from scipy.signal import detrend
+from scipy.signal import find_peaks
 
 def Vm_testplot (data, data_flt, title=''):
     """
@@ -88,6 +88,21 @@ def butter_bandpass_filter(data, lowcut, highcut, fs, order=5):
     y = filtfilt(b, a, data)
     return y
 
+
+def moving_avg_normalise(data, mvg_avg_window = 800):
+    # Calculate moving average
+    moving_avg = np.convolve(data, np.ones(mvg_avg_window), 'valid') / mvg_avg_window
+    
+    # Extend the moving average array to the same size as the original data by padding
+    pad_start = mvg_avg_window // 2
+    pad_end = (mvg_avg_window - 1) // 2
+    moving_avg = np.concatenate((np.full(pad_start, moving_avg[0]), moving_avg, np.full(pad_end, moving_avg[-1])))
+    
+    # Subtract the moving average from the original data to locally normalize it
+    normalized_Vm = data - moving_avg
+    
+    return normalized_Vm
+
 def lower_bound(data, mvg_avg_window = 800, sub_window_size=10000):
     
     normalized_Vm = moving_avg_normalise(data, mvg_avg_window)
@@ -122,20 +137,19 @@ def lower_bound(data, mvg_avg_window = 800, sub_window_size=10000):
     # Set the lower threshold
     return bound
 
-def find_spikelet_moving_avg(Vm, Vm_thrs = -0.03, window_size= 1000, lower_threshold= 0.002, SR_Vm=20000):
-    
+import numpy as np
+
+def find_spikelet_moving_avg(Vm, Vm_thrs=-0.03, window_size=1000, lower_threshold=0.002, SR_Vm=20000):
     AP_Win = 0.0015  # time (s) to search for AP's peak
     AP_length = np.round(AP_Win * SR_Vm)
 
     normalized_Vm = moving_avg_normalise(Vm, window_size)
-    
-    All_Thrs_Onset = np.diff(np.divide(normalized_Vm- lower_threshold, np.abs(normalized_Vm - lower_threshold)))
+    All_Thrs_Onset = np.diff(np.divide(normalized_Vm - lower_threshold, np.abs(normalized_Vm - lower_threshold)))
     All_Thrs_Index, Peaks = find_peaks(All_Thrs_Onset, height=0.1, prominence=0.5, distance=SR_Vm * 0.001)
 
-    # Find the spikelets in the normalized membrane potential
-    #spikelets_index, _ = find_peaks(normalized_Vm, height=(lower_threshold, upper_threshold))
-    spikelets_index = []
-    
+    spikelets_param_output = []
+    spikelets_indices = []  # List to store the indices of the spikelets
+
     if (All_Thrs_Index.any()):
         for i in range(len(All_Thrs_Index)):
             pt1 = int(All_Thrs_Index[i])
@@ -147,13 +161,25 @@ def find_spikelet_moving_avg(Vm, Vm_thrs = -0.03, window_size= 1000, lower_thres
                 
                 if (Ind.any()):
                     AP_Index = pt1 + Ind - 1
-                     
-                    if (AP_Index.any()):
-                        spikelets_index.append(AP_Index)
-                        
-    spikelets_index = [i for i in spikelets_index if Vm[i] <= Vm_thrs]
+                    if (AP_Index.any() and Vm[AP_Index] <= Vm_thrs):
+                        # Calculate parameters
+                        Thrs_Time = All_Thrs_Index[i] / SR_Vm
+                        Peak_Time = AP_Index / SR_Vm
+                        Peak_Vm = Vm[AP_Index]
+                        Thrs_Vm = Vm[All_Thrs_Index[i]]
+                        Spikelet_Amp = Peak_Vm - Thrs_Vm
 
-    return spikelets_index 
+                        # Add parameters to output and index to spikelets_indices
+                        spikelets_param_output.append([Thrs_Time, Thrs_Vm, Peak_Time, Peak_Vm, Spikelet_Amp])
+                        spikelets_indices.append(AP_Index)
+
+    # Convert to numpy array for easy handling and remove NaNs
+    spikelets_param_output = np.array(spikelets_param_output)
+    spikelets_param_output = spikelets_param_output[~np.isnan(spikelets_param_output).all(axis=1), :]
+
+    return spikelets_param_output, spikelets_indices
+
+    
 
 def local_lower_bound(data, mvg_avg_window = 800, sub_window_size=2000):
     # Calculate moving average
@@ -175,4 +201,49 @@ def local_lower_bound(data, mvg_avg_window = 800, sub_window_size=2000):
     lower_threshold = np.array(std_dev) + 1.5*base_bound
 
     return lower_threshold
+
+
+def df_spikelet_converter(spikelet_params):
+    """
+    Converts spikelet parameters into a pandas DataFrame.
+
+    Parameters:
+    spikelet_params (numpy array): A 2D array where each row represents a spikelet and the columns represent the spikelet's parameters.
+
+    Returns:
+    DataFrame: A pandas DataFrame with the following columns:
+        'spikelet_thresh_times': Threshold time of the spikelet
+        'spikelet_thresh_vm': Membrane potential at the threshold
+        'spikelet_peak_times': Peak time of the spikelet
+        'spikelet_peak_vm': Membrane potential at the peak
+        'spikelet_amp': Amplitude of the spikelet
+    """
+    return pd.DataFrame(spikelet_params, columns=['spikelet_thresh_times', 'spikelet_thresh_vm', 
+                                                  'spikelet_peak_times', 'spikelet_peak_vm', 
+                                                  'spikelet_amp'])
+
+
+def calculate_spikelet_params(row):
+    spikelet_params, _ = find_spikelet_moving_avg(row['Sweep_MembranePotential'], 
+                                                  Vm_thrs=row['Cell_APThreshold_Slope'], 
+                                                  SR_Vm=2000)
+
+    if spikelet_params.size == 0:
+        return pd.Series({
+            'nbr_spikelets': 0,
+            'avg_spikelet_duration': np.nan,
+            'avg_spikelet_amp': np.nan,
+            'avg_spikelet_thresh_vm': np.nan,
+            'avg_consecutive_spikelet_interval': np.nan
+        })
+
+    df_spikelets = pd.DataFrame(spikelet_params, columns=['spikelet_thresh_times', 'spikelet_thresh_vm', 'spikelet_peak_times', 'spikelet_peak_vm', 'spikelet_amp'])
+
+    return pd.Series({
+        'nbr_spikelets': len(df_spikelets),
+        'avg_spikelet_duration': df_spikelets['spikelet_peak_times'].mean() - df_spikelets['spikelet_thresh_times'].mean(),
+        'avg_spikelet_amp': df_spikelets['spikelet_amp'].mean(),
+        'avg_spikelet_thresh_vm': df_spikelets['spikelet_thresh_vm'].mean(),
+        'avg_consecutive_spikelet_interval': df_spikelets['spikelet_thresh_times'].diff().mean()
+    })
 
